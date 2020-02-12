@@ -1,0 +1,79 @@
+#!/bin/bash
+
+sdir="$HOME/.config/slog"
+mkdir -p "$sdir"
+
+authenticate()
+{
+echo "Please Authenticate Root Access...."
+sudo ls > /dev/null
+if ! [ $? = 0 ]; then
+	echo "Authentication Failed: Closing Programme...."
+	echo ""
+	exit
+else
+	echo "Authenticated...."
+fi
+}
+
+doExit() {
+echo "Problem with syntax!"
+echo "Usage : $(basename $0) [install|remove] PackageName"
+exit 0
+}
+
+doMakeUfile() {
+sed -ibackup "/Reading package lists.../,/The following NEW packages will be installed:/d" "$sdir/$1.install.slog" #delete all lines between two strings
+
+mv $sdir/$1.install.slog $sdir/$1.ufiles.slog
+mv $sdir/$1.install.slogbackup $sdir/$1.install.slog
+
+noOfInstalls=$(cat $sdir/$1.ufiles.slog | grep "newly installed," | cut     -d' ' -f3)
+
+for record in $(cat $sdir/$1.ufiles.slog); do
+    echo "$record" >> $sdir/temp.slog
+done
+
+sed -n 1,"$noOfInstalls"p $sdir/temp.slog > $sdir/$1.ufiles.slog
+rm $sdir/temp.slog
+}
+
+if [ "$#" != "2" ]; then
+    doExit
+fi
+
+authenticate
+
+if [ "$1" = "install" ]; then
+    exec > >(tee -i $sdir/$2.install.slog); exec 2>&1
+    sudo apt-get -yy install $2
+    exec 2>&-
+    doMakeUfile $2
+
+elif [ "$1" = "remove" ]; then
+    cat $sdir/*ufiles.slog > $sdir/zfiles.slog #combibe all ufiles.slog
+    exec > >(tee -i $sdir/$2.remove.slog); exec 2>&1
+
+    cat $sdir/$2.install.slog | grep "$2 is already" > /dev/null
+    if [ $? = 0 ]; then
+        exit 0
+    fi
+
+    sudo apt-get -yy remove $2 --purge --autoremove
+    for i in $(cat $sdir/$2.ufiles.slog); do
+	if [ $(cat $sdir/zfiles.slog | grep -x "$i" | wc -l) = 1 ]; then
+	    sudo apt-get -yy remove $i
+	else
+	    echo $i >> $sdir/$2.InUseLibs.slog
+	fi
+    done
+    mkdir -p $sdir/uninstalled
+    mv $sdir/$2.install.slog $sdir/uninstalled/.
+    mv $sdir/$2.ufiles.slog $sdir/uninstalled/.
+    mv $sdir/$2.remove.slog $sdir/uninstalled/.
+    exec 2>&-
+else
+    doExit
+fi
+exit 0
+
