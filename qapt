@@ -1,0 +1,668 @@
+#!/bin/bash
+# =============================================================================
+# qapt — Total Package Installer / Uninstaller
+# =============================================================================
+# Tracks every package (and dependency) installed through qapt.
+# On removal, only removes packages that:
+#   (a) were installed as part of that label, AND
+#   (b) are not currently needed by any other qapt-managed label.
+#
+# Usage:
+#   qapt install PACKAGE [PACKAGE...] [--label NAME] [--desc "text"]
+#   qapt remove  LABEL
+#   qapt list
+#   qapt history
+#   qapt audit   LABEL
+#   qapt --help
+# =============================================================================
+
+set -o errexit
+set -o nounset
+set -o pipefail
+IFS=$'\n\t'
+
+# ---------------------------------------------------------------------------
+# Directories and file layout
+# ---------------------------------------------------------------------------
+#
+# $QAPT_DIR/
+#   active/
+#     <label>.meta    — label name, top-level packages, description, date
+#     <label>.pkgs    — full set of packages owned by this label
+#   history/
+#     <label>.meta    — same as active meta, written on removal (for review)
+#   snapshots/        — before/after dpkg snapshots (temporary, cleaned up)
+#
+# ---------------------------------------------------------------------------
+
+readonly QAPT_DIR="${HOME}/.local/share/qapt"
+readonly ACTIVE_DIR="$QAPT_DIR/active"
+readonly HISTORY_DIR="$QAPT_DIR/history"
+readonly SNAP_DIR="$QAPT_DIR/snapshots"
+
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly CYAN='\033[0;36m'
+readonly BOLD='\033[1m'
+readonly NC='\033[0m'
+
+mkdir -p "$ACTIVE_DIR" "$HISTORY_DIR" "$SNAP_DIR"
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+log_error()   { echo -e "${RED}${BOLD}ERROR:${NC}   $*" >&2; }
+log_success() { echo -e "${GREEN}${BOLD}OK:${NC}      $*"; }
+log_warning() { echo -e "${YELLOW}${BOLD}WARNING:${NC} $*"; }
+log_info()    { echo -e "${CYAN}${BOLD}INFO:${NC}    $*"; }
+log_step()    { echo -e "${BOLD}==>${NC} $*"; }
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
+cleanup() {
+    rm -f "$SNAP_DIR"/before_*.txt "$SNAP_DIR"/after_*.txt \
+          "$SNAP_DIR"/protected.* "$SNAP_DIR"/to_remove.*
+}
+trap cleanup EXIT INT TERM
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat << EOF
+
+${BOLD}qapt${NC} — Total Package Installer / Uninstaller
+
+${BOLD}USAGE${NC}
+    qapt install PACKAGE [PACKAGE ...] [--label NAME] [--desc "description"] [--each]
+    qapt remove  LABEL
+    qapt list
+    qapt history
+    qapt audit   LABEL
+    qapt --help
+
+${BOLD}COMMANDS${NC}
+
+    install     Install one or more packages and track them under a label.
+                If --label is omitted and a single package is given, the
+                package name is used as the label automatically.
+                If multiple packages are given without --label, you will
+                be prompted to supply one.
+                Use --each to install each package under its own label
+                (package name used as label for each) without prompting.
+
+    remove      Remove everything installed under LABEL, skipping any
+                package that is also needed by another active label.
+
+    list        Show all active labels and their top-level packages.
+
+    history     Show labels that have been removed (available for reinstall
+                reference).
+
+    audit       Show what is tracked under a label without removing anything.
+
+${BOLD}OPTIONS${NC}
+
+    --label NAME      Label to group this install under.
+    --desc  TEXT      Free-text description stored with the label.
+
+${BOLD}EXAMPLES${NC}
+
+    qapt install gimp
+    qapt install gimp inkscape --label graphics_suite --desc "Design tools"
+    qapt install libnettle8 libhogweed6 --label gimp_deps
+    qapt install gimp inkscape vlc --each
+    qapt remove  gimp
+    qapt list
+    qapt history
+    qapt audit   gimp
+
+EOF
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+validate_label() {
+    local label="$1"
+    if [[ ! "$label" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+        log_error "Invalid label '${label}'. Use only letters, numbers, underscore, dot, hyphen."
+        exit 1
+    fi
+}
+
+validate_package_name() {
+    local pkg="$1"
+    if [[ ! "$pkg" =~ ^[a-zA-Z0-9\.+:-]+$ ]]; then
+        log_error "Invalid package name: $pkg"
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+authenticate() {
+    log_step "Authenticating..."
+    if ! sudo -v; then
+        log_error "Authentication failed."
+        exit 1
+    fi
+    log_success "Authenticated"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# State snapshots
+# ---------------------------------------------------------------------------
+
+# Record the full set of installed packages right now.
+# slot = "before" or "after", label = qapt label being processed
+snapshot() {
+    local slot="$1"
+    local label="$2"
+
+    dpkg-query -W -f='${Package}\n' 2>/dev/null \
+        | sort -u > "$SNAP_DIR/${slot}_${label}.txt"
+}
+
+# Diff before/after snapshots → new packages introduced by this install.
+# Writes to $ACTIVE_DIR/<label>.pkgs
+compute_new_packages() {
+    local label="$1"
+    local before="$SNAP_DIR/before_${label}.txt"
+    local after="$SNAP_DIR/after_${label}.txt"
+    local pkgs_file="$ACTIVE_DIR/${label}.pkgs"
+
+    if [[ ! -f "$before" || ! -f "$after" ]]; then
+        log_error "Snapshots missing for label '${label}' — cannot compute installed packages."
+        return 1
+    fi
+
+    comm -13 "$before" "$after" > "$pkgs_file"
+
+    rm -f "$before" "$after"
+}
+
+# ---------------------------------------------------------------------------
+# Meta file helpers
+# ---------------------------------------------------------------------------
+
+write_meta() {
+    local dir="$1"
+    local label="$2"
+    local description="$3"
+    shift 3
+    local top_level_pkgs=("$@")
+
+    {
+        echo "label=${label}"
+        echo "date=$(date --iso-8601=seconds)"
+        echo "description=${description}"
+        printf 'packages=%s\n' "${top_level_pkgs[*]}"
+    } > "${dir}/${label}.meta"
+}
+
+read_meta_field() {
+    local file="$1"
+    local field="$2"
+    grep "^${field}=" "$file" | cut -d'=' -f2-
+}
+
+# ---------------------------------------------------------------------------
+# install
+# ---------------------------------------------------------------------------
+
+cmd_install() {
+    local label=""
+    local description=""
+    local each=false
+    local packages=()
+
+    # Parse arguments
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            --label)
+                [[ -z "${2:-}" ]] && { log_error "--label requires a value"; exit 1; }
+                label="$2"; shift 2 ;;
+            --desc)
+                [[ -z "${2:-}" ]] && { log_error "--desc requires a value"; exit 1; }
+                description="$2"; shift 2 ;;
+            --each)
+                each=true; shift ;;
+            -*)
+                log_error "Unknown option: $1"; exit 1 ;;
+            *)
+                validate_package_name "$1"
+                packages+=("$1"); shift ;;
+        esac
+    done
+
+    if [[ "${#packages[@]}" -eq 0 ]]; then
+        log_error "No packages specified."
+        exit 1
+    fi
+
+    if [[ "$each" == true ]]; then
+        [[ "${#packages[@]}" -lt 2 ]] && { log_error "--each requires at least two packages."; exit 1; }
+        [[ -n "$label" ]] && { log_error "--each and --label are mutually exclusive."; exit 1; }
+        authenticate
+        for pkg in "${packages[@]}"; do
+            cmd_install "$pkg"
+        done
+        exit 0
+    fi
+
+    # Determine label
+    if [[ -z "$label" ]]; then
+        if [[ "${#packages[@]}" -eq 1 ]]; then
+            # Use package name as label, stripping any :arch suffix
+            label="${packages[0]%%:*}"
+        else
+            echo ""
+            echo "Multiple packages specified without --label."
+            read -r -p "Enter a label for this group: " label
+            [[ -z "$label" ]] && { log_error "Label cannot be empty."; exit 1; }
+        fi
+    fi
+
+    validate_label "$label"
+
+    # Pre-check: if every requested package is already installed, skip the
+    # label-conflict check and exit cleanly (mirrors post-install behaviour).
+    local all_installed=true
+    for pkg in "${packages[@]}"; do
+        local base_pkg="${pkg%%:*}"
+        if ! dpkg-query -W -f='${Status}' "$base_pkg" 2>/dev/null \
+                | grep -q "install ok installed"; then
+            all_installed=false
+            break
+        fi
+    done
+
+    if [[ "$all_installed" == true ]]; then
+        echo ""
+        log_warning "Nothing new was installed — '${packages[*]}' already present on the system."
+        if [[ -f "$ACTIVE_DIR/${label}.meta" ]]; then
+            echo "  Already managed under label '${label}'. Run 'qapt audit ${label}' for details."
+        else
+            echo "  No label was created."
+        fi
+        echo ""
+        exit 0
+    fi
+
+    if [[ -f "$ACTIVE_DIR/${label}.meta" ]]; then
+        log_error "Label '${label}' already exists. Use a different label or remove it first."
+        exit 1
+    fi
+
+    authenticate
+
+    log_step "Snapshotting system state (before)..."
+    snapshot "before" "$label"
+
+    log_step "Installing: ${packages[*]}"
+    echo ""
+    if ! sudo apt-get -y install "${packages[@]}"; then
+        log_error "apt-get install failed."
+        rm -f "$SNAP_DIR/before_${label}.txt"
+        exit 1
+    fi
+    echo ""
+
+    # Verify each top-level package actually installed
+    local install_ok=true
+    for pkg in "${packages[@]}"; do
+        local base_pkg="${pkg%%:*}"
+        if ! dpkg-query -W -f='${Status}' "$base_pkg" 2>/dev/null \
+                | grep -q "install ok installed"; then
+            log_warning "Package '${base_pkg}' does not appear to be installed."
+            install_ok=false
+        fi
+    done
+    if [[ "$install_ok" == false ]]; then
+        log_error "One or more packages failed to install. Aborting label creation."
+        rm -f "$SNAP_DIR/before_${label}.txt"
+        exit 1
+    fi
+
+    log_step "Snapshotting system state (after)..."
+    snapshot "after" "$label"
+
+    log_step "Computing installed package set..."
+    compute_new_packages "$label"
+
+    local pkg_count=0
+    [[ -s "$ACTIVE_DIR/${label}.pkgs" ]] \
+        && pkg_count=$(wc -l < "$ACTIVE_DIR/${label}.pkgs")
+
+    # If nothing new was installed (package was already present), discard
+    # the empty pkgs file and do not create a label entry.
+    if (( pkg_count == 0 )); then
+        rm -f "$ACTIVE_DIR/${label}.pkgs"
+        echo ""
+        log_warning "Nothing new was installed — '${packages[*]}' already present on the system."
+        echo "  No label was created."
+        echo ""
+        exit 0
+    fi
+
+    write_meta "$ACTIVE_DIR" "$label" "$description" "${packages[@]}"
+
+    echo ""
+    log_success "Label '${label}' created."
+    log_info    "Top-level packages : ${packages[*]}"
+    log_info    "Total pkgs tracked : ${pkg_count} (including dependencies)"
+    [[ -n "$description" ]] && log_info "Description        : $description"
+    echo ""
+    echo "  To remove everything this installed: qapt remove ${label}"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# remove
+# ---------------------------------------------------------------------------
+
+cmd_remove() {
+    local label="${1:-}"
+
+    if [[ -z "$label" ]]; then
+        log_error "No label specified. Usage: qapt remove LABEL"
+        exit 1
+    fi
+
+    validate_label "$label"
+
+    if [[ ! -f "$ACTIVE_DIR/${label}.meta" ]]; then
+        log_error "No active label named '${label}'. Run 'qapt list' to see active labels."
+        exit 1
+    fi
+
+    if [[ ! -f "$ACTIVE_DIR/${label}.pkgs" ]]; then
+        log_error "Package list missing for label '${label}'. Cannot safely remove."
+        exit 1
+    fi
+
+    authenticate
+
+    # Build the union of packages tracked by OTHER active labels (protected)
+    local protected_pkgs
+    protected_pkgs=$(mktemp "$SNAP_DIR/protected.XXXXXX")
+
+    shopt -s nullglob
+    local other_pkg_files=()
+    for f in "$ACTIVE_DIR"/*.pkgs; do
+        local other_label
+        other_label=$(basename "$f" .pkgs)
+        [[ "$other_label" != "$label" ]] && other_pkg_files+=("$f")
+    done
+    shopt -u nullglob
+
+    if (( ${#other_pkg_files[@]} > 0 )); then
+        sort -u "${other_pkg_files[@]}" > "$protected_pkgs"
+    else
+        : > "$protected_pkgs"
+    fi
+
+    # Packages to remove = label's pkgs MINUS protected pkgs
+    local to_remove
+    to_remove=$(mktemp "$SNAP_DIR/to_remove.XXXXXX")
+    comm -23 \
+        <(sort -u "$ACTIVE_DIR/${label}.pkgs") \
+        <(sort -u "$protected_pkgs") \
+        > "$to_remove"
+
+    # Count packages being skipped (shared with other labels)
+    local skip_count=0
+    skip_count=$(comm -12 \
+        <(sort -u "$ACTIVE_DIR/${label}.pkgs") \
+        <(sort -u "$protected_pkgs") \
+        | wc -l)
+
+    local remove_count=0
+    [[ -s "$to_remove" ]] && remove_count=$(wc -l < "$to_remove")
+
+    echo ""
+    log_info "Label                          : ${label}"
+    log_info "Packages to remove             : ${remove_count}"
+    log_info "Skipped (shared by other labels): ${skip_count}"
+    echo ""
+
+    if (( remove_count == 0 )); then
+        log_warning "No packages to remove — all are shared with other labels."
+        rm -f "$protected_pkgs" "$to_remove"
+        _archive_label "$label"
+        log_success "Label '${label}' archived to history."
+        return 0
+    fi
+
+    echo "Packages that will be removed:"
+    sed 's/^/  /' "$to_remove"
+    echo ""
+
+    read -r -p "Proceed with removal? (y/N) " reply
+    if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+        log_info "Removal cancelled."
+        rm -f "$protected_pkgs" "$to_remove"
+        exit 0
+    fi
+
+    echo ""
+    log_step "Removing packages..."
+
+    # Load into array — safe because IFS is set to newline+tab
+    local pkgs_to_remove=()
+    while IFS= read -r pkg; do
+        [[ -n "$pkg" ]] && pkgs_to_remove+=("$pkg")
+    done < "$to_remove"
+
+    if ! sudo apt-get -y remove --purge "${pkgs_to_remove[@]}"; then
+        log_error "apt-get remove encountered errors."
+        rm -f "$protected_pkgs" "$to_remove"
+        exit 1
+    fi
+
+    # Clean up any orphaned auto-installed packages
+    sudo apt-get -y autoremove --purge || true
+
+    echo ""
+    rm -f "$protected_pkgs" "$to_remove"
+
+    _archive_label "$label"
+
+    log_success "Label '${label}' removed successfully."
+    echo ""
+    echo "  A record of this install has been saved to history."
+    echo "  Run 'qapt history' to review it, or 'qapt audit ${label}' for details."
+    echo ""
+}
+
+# Move a label's meta to history; remove its active pkgs + meta files.
+# The pkgs file is intentionally NOT copied to history — you only need
+# the top-level package names to reinstall, not the full dependency list.
+_archive_label() {
+    local label="$1"
+    cp "$ACTIVE_DIR/${label}.meta" "$HISTORY_DIR/${label}.meta"
+    echo "removed=$(date --iso-8601=seconds)" >> "$HISTORY_DIR/${label}.meta"
+    rm -f "$ACTIVE_DIR/${label}.meta" "$ACTIVE_DIR/${label}.pkgs"
+}
+
+# ---------------------------------------------------------------------------
+# list
+# ---------------------------------------------------------------------------
+
+cmd_list() {
+    echo ""
+    echo -e "${BOLD}Active qapt labels${NC}"
+    echo "────────────────────────────────────────────────────"
+
+    shopt -s nullglob
+    local meta_files=("$ACTIVE_DIR"/*.meta)
+    shopt -u nullglob
+
+    if (( ${#meta_files[@]} == 0 )); then
+        echo "  (none)"
+        echo ""
+        return 0
+    fi
+
+    for f in "${meta_files[@]}"; do
+        local lbl date desc pkgs pkg_count
+        lbl=$(read_meta_field "$f" "label")
+        date=$(read_meta_field "$f" "date")
+        desc=$(read_meta_field "$f" "description")
+        pkgs=$(read_meta_field "$f" "packages")
+        pkg_count=0
+        local pkgs_file="$ACTIVE_DIR/${lbl}.pkgs"
+        [[ -s "$pkgs_file" ]] && pkg_count=$(wc -l < "$pkgs_file")
+
+        echo ""
+        echo -e "  ${BOLD}${lbl}${NC}"
+        echo    "    Installed      : ${date}"
+        echo    "    Top-level pkgs : ${pkgs}"
+        echo    "    Total tracked  : ${pkg_count} packages"
+        [[ -n "$desc" ]] && echo "    Description    : ${desc}"
+    done
+
+    echo ""
+    echo "────────────────────────────────────────────────────"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# history
+# ---------------------------------------------------------------------------
+
+cmd_history() {
+    echo ""
+    echo -e "${BOLD}qapt install history (removed labels)${NC}"
+    echo "────────────────────────────────────────────────────"
+
+    shopt -s nullglob
+    local meta_files=("$HISTORY_DIR"/*.meta)
+    shopt -u nullglob
+
+    if (( ${#meta_files[@]} == 0 )); then
+        echo "  (no history yet)"
+        echo ""
+        return 0
+    fi
+
+    for f in "${meta_files[@]}"; do
+        local lbl date removed desc pkgs
+        lbl=$(read_meta_field "$f" "label")
+        date=$(read_meta_field "$f" "date")
+        removed=$(read_meta_field "$f" "removed")
+        desc=$(read_meta_field "$f" "description")
+        pkgs=$(read_meta_field "$f" "packages")
+
+        echo ""
+        echo -e "  ${BOLD}${lbl}${NC}"
+        echo    "    Installed : ${date}"
+        echo    "    Removed   : ${removed}"
+        echo    "    Packages  : ${pkgs}"
+        [[ -n "$desc" ]] && echo "    Notes     : ${desc}"
+        echo    "    Reinstall : sudo apt-get install ${pkgs}"
+    done
+
+    echo ""
+    echo "────────────────────────────────────────────────────"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# audit
+# ---------------------------------------------------------------------------
+
+cmd_audit() {
+    local label="${1:-}"
+
+    if [[ -z "$label" ]]; then
+        log_error "No label specified. Usage: qapt audit LABEL"
+        exit 1
+    fi
+
+    validate_label "$label"
+
+    # Check active first, then history
+    local meta_file="" pkgs_file=""
+    if [[ -f "$ACTIVE_DIR/${label}.meta" ]]; then
+        meta_file="$ACTIVE_DIR/${label}.meta"
+        pkgs_file="$ACTIVE_DIR/${label}.pkgs"
+    elif [[ -f "$HISTORY_DIR/${label}.meta" ]]; then
+        meta_file="$HISTORY_DIR/${label}.meta"
+        pkgs_file=""
+    else
+        log_error "No label named '${label}' found in active installs or history."
+        exit 1
+    fi
+
+    local lbl date desc pkgs
+    lbl=$(read_meta_field "$meta_file" "label")
+    date=$(read_meta_field "$meta_file" "date")
+    desc=$(read_meta_field "$meta_file" "description")
+    pkgs=$(read_meta_field "$meta_file" "packages")
+
+    echo ""
+    echo -e "${BOLD}Audit: ${lbl}${NC}"
+    echo "────────────────────────────────────────────────────"
+    echo "  Status         : $( [[ -n "$pkgs_file" ]] && echo "ACTIVE" || echo "REMOVED (history)" )"
+    echo "  Installed      : ${date}"
+    echo "  Top-level pkgs : ${pkgs}"
+    [[ -n "$desc" ]] && echo "  Description    : ${desc}"
+
+    if [[ -n "$pkgs_file" && -s "$pkgs_file" ]]; then
+        local pkg_count
+        pkg_count=$(wc -l < "$pkgs_file")
+        echo ""
+        echo "  Total packages tracked: ${pkg_count}"
+        echo ""
+        echo "  Full package list (including dependencies):"
+        sed 's/^/    /' "$pkgs_file"
+    elif [[ -z "$pkgs_file" ]]; then
+        echo ""
+        echo "  (Full dependency list not retained after removal.)"
+        echo "  To reinstall: sudo apt-get install ${pkgs}"
+    fi
+
+    echo ""
+    echo "────────────────────────────────────────────────────"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+main() {
+    if [[ "$#" -eq 0 || "$1" == "--help" || "$1" == "-h" ]]; then
+        usage
+    fi
+
+    local cmd="$1"
+    shift
+
+    case "$cmd" in
+        install) cmd_install "$@" ;;
+        remove)  cmd_remove  "$@" ;;
+        list)    cmd_list         ;;
+        history) cmd_history      ;;
+        audit)   cmd_audit   "$@" ;;
+        *)
+            log_error "Unknown command: '${cmd}'"
+            echo "Run 'qapt --help' for usage."
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
