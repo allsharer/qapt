@@ -256,7 +256,7 @@ cmd_install() {
         [[ -n "$label" ]] && { log_error "--each and --label are mutually exclusive."; exit 1; }
         authenticate
         for pkg in "${packages[@]}"; do
-            cmd_install "$pkg"
+            ( cmd_install "$pkg" )
         done
         exit 0
     fi
