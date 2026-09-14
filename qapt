@@ -79,7 +79,7 @@ usage() {
 ${BOLD}qapt${NC} — Total Package Installer / Uninstaller
 
 ${BOLD}USAGE${NC}
-    qapt install PACKAGE [PACKAGE ...] [--label NAME] [--desc "description"] [--each]
+    qapt install PACKAGE|./FILE.deb [PACKAGE|./FILE.deb ...] [--label NAME] [--desc "description"] [--each]
     qapt remove  LABEL
     qapt list
     qapt history
@@ -89,8 +89,11 @@ ${BOLD}USAGE${NC}
 ${BOLD}COMMANDS${NC}
 
     install     Install one or more packages and track them under a label.
+                Accepts repo package names and/or paths to local .deb files
+                (e.g. a downloaded package) — both are tracked the same way.
                 If --label is omitted and a single package is given, the
-                package name is used as the label automatically.
+                package name is used as the label automatically (for a
+                .deb file, the name is read from the file itself).
                 If multiple packages are given without --label, you will
                 be prompted to supply one.
                 Use --each to install each package under its own label
@@ -117,6 +120,8 @@ ${BOLD}EXAMPLES${NC}
     qapt install gimp inkscape --label graphics_suite --desc "Design tools"
     qapt install libnettle8 libhogweed6 --label gimp_deps
     qapt install gimp inkscape vlc --each
+    qapt install ./google-chrome-stable_current_amd64.deb
+    qapt install gimp ./slack-desktop_amd64.deb --label extras
     qapt remove  gimp
     qapt list
     qapt history
@@ -144,6 +149,29 @@ validate_package_name() {
         log_error "Invalid package name: $pkg"
         exit 1
     fi
+}
+
+validate_deb_file() {
+    local path="$1"
+    if [[ ! -f "$path" ]]; then
+        log_error "File not found: $path"
+        exit 1
+    fi
+    if [[ ! -r "$path" ]]; then
+        log_error "File not readable: $path"
+        exit 1
+    fi
+}
+
+# Extract the "Package" control field from a local .deb archive.
+# Prints the name on success; returns 1 (prints nothing) on failure —
+# callers must check the exit status themselves.
+deb_package_name() {
+    local path="$1"
+    local name
+    name=$(dpkg-deb -f "$path" Package 2>/dev/null) || return 1
+    [[ -z "$name" ]] && return 1
+    printf '%s' "$name"
 }
 
 # ---------------------------------------------------------------------------
@@ -225,7 +253,9 @@ cmd_install() {
     local label=""
     local description=""
     local each=false
-    local packages=()
+    local packages=()      # exact args passed to apt-get (repo names or local .deb paths)
+    local meta_names=()    # bare package names, index-aligned with packages, for
+                            # dpkg-query checks, label defaults, and the .meta file
 
     # Parse arguments
     while [[ "$#" -gt 0 ]]; do
@@ -241,8 +271,27 @@ cmd_install() {
             -*)
                 log_error "Unknown option: $1"; exit 1 ;;
             *)
-                validate_package_name "$1"
-                packages+=("$1"); shift ;;
+                if [[ "$1" == *.deb ]]; then
+                    local deb_path="$1"
+                    # Make sure apt-get treats a bare filename as a local file,
+                    # not a repo package name.
+                    [[ "$deb_path" != */* ]] && deb_path="./${deb_path}"
+                    validate_deb_file "$deb_path"
+
+                    local deb_name
+                    if ! deb_name=$(deb_package_name "$deb_path"); then
+                        log_error "Could not read package info from '$deb_path'. Is it a valid .deb file?"
+                        exit 1
+                    fi
+
+                    packages+=("$deb_path")
+                    meta_names+=("$deb_name")
+                else
+                    validate_package_name "$1"
+                    packages+=("$1")
+                    meta_names+=("$1")
+                fi
+                shift ;;
         esac
     done
 
@@ -265,7 +314,8 @@ cmd_install() {
     if [[ -z "$label" ]]; then
         if [[ "${#packages[@]}" -eq 1 ]]; then
             # Use package name as label, stripping any :arch suffix
-            label="${packages[0]%%:*}"
+            # (meta_names already holds the resolved name for .deb files)
+            label="${meta_names[0]%%:*}"
         else
             echo ""
             echo "Multiple packages specified without --label."
@@ -279,8 +329,8 @@ cmd_install() {
     # Pre-check: if every requested package is already installed, skip the
     # label-conflict check and exit cleanly (mirrors post-install behaviour).
     local all_installed=true
-    for pkg in "${packages[@]}"; do
-        local base_pkg="${pkg%%:*}"
+    for name in "${meta_names[@]}"; do
+        local base_pkg="${name%%:*}"
         if ! dpkg-query -W -f='${Status}' "$base_pkg" 2>/dev/null \
                 | grep -q "install ok installed"; then
             all_installed=false
@@ -290,7 +340,7 @@ cmd_install() {
 
     if [[ "$all_installed" == true ]]; then
         echo ""
-        log_warning "Nothing new was installed — '${packages[*]}' already present on the system."
+        log_warning "Nothing new was installed — '${meta_names[*]}' already present on the system."
         if [[ -f "$ACTIVE_DIR/${label}.meta" ]]; then
             echo "  Already managed under label '${label}'. Run 'qapt audit ${label}' for details."
         else
@@ -321,8 +371,8 @@ cmd_install() {
 
     # Verify each top-level package actually installed
     local install_ok=true
-    for pkg in "${packages[@]}"; do
-        local base_pkg="${pkg%%:*}"
+    for name in "${meta_names[@]}"; do
+        local base_pkg="${name%%:*}"
         if ! dpkg-query -W -f='${Status}' "$base_pkg" 2>/dev/null \
                 | grep -q "install ok installed"; then
             log_warning "Package '${base_pkg}' does not appear to be installed."
@@ -350,17 +400,17 @@ cmd_install() {
     if (( pkg_count == 0 )); then
         rm -f "$ACTIVE_DIR/${label}.pkgs"
         echo ""
-        log_warning "Nothing new was installed — '${packages[*]}' already present on the system."
+        log_warning "Nothing new was installed — '${meta_names[*]}' already present on the system."
         echo "  No label was created."
         echo ""
         exit 0
     fi
 
-    write_meta "$ACTIVE_DIR" "$label" "$description" "${packages[@]}"
+    write_meta "$ACTIVE_DIR" "$label" "$description" "${meta_names[@]}"
 
     echo ""
     log_success "Label '${label}' created."
-    log_info    "Top-level packages : ${packages[*]}"
+    log_info    "Top-level packages : ${meta_names[*]}"
     log_info    "Total pkgs tracked : ${pkg_count} (including dependencies)"
     [[ -n "$description" ]] && log_info "Description        : $description"
     echo ""
