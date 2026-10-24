@@ -5,11 +5,16 @@
 # Tracks every package (and dependency) installed through qapt.
 # On removal, only removes packages that:
 #   (a) were installed as part of that label, AND
-#   (b) are not currently needed by any other qapt-managed label.
+#   (b) are not tracked by any other qapt-managed label, AND
+#   (c) are not needed by any other installed software, AND
+#   (d) have not since been installed explicitly by you.
+# The plan is verified with an apt simulation before anything is removed,
+# so nothing outside the label is ever taken with it.
 #
 # Usage:
 #   qapt install PACKAGE [PACKAGE...] [--label NAME] [--desc "text"]
-#   qapt remove  LABEL
+#   qapt update  PACKAGE|./FILE.deb [--label NAME]
+#   qapt remove  LABEL [--dry-run]
 #   qapt list
 #   qapt history
 #   qapt audit   LABEL
@@ -47,6 +52,16 @@ readonly CYAN='\033[0;36m'
 readonly BOLD='\033[1m'
 readonly NC='\033[0m'
 
+# Wait up to 5 minutes for another apt/dpkg process (e.g. unattended-upgrades)
+# to finish instead of failing straight away.
+readonly APT_LOCK_WAIT=(-o DPkg::Lock::Timeout=300)
+
+# Standard folders in ~/.local/share etc. that are never one app's leftovers
+readonly SHARED_USER_DIRS="applications backgrounds cache config desktop-directories fonts icons keyrings local mime sounds themes trash"
+
+# Scratch directory for the removal plan (set in cmd_remove)
+PLAN_DIR=""
+
 mkdir -p "$ACTIVE_DIR" "$HISTORY_DIR" "$SNAP_DIR"
 
 # ---------------------------------------------------------------------------
@@ -65,7 +80,9 @@ log_step()    { echo -e "${BOLD}==>${NC} $*"; }
 
 cleanup() {
     rm -f "$SNAP_DIR"/before_*.txt "$SNAP_DIR"/after_*.txt \
-          "$SNAP_DIR"/protected.* "$SNAP_DIR"/to_remove.*
+          "$SNAP_DIR"/sim_*.txt "$SNAP_DIR"/expected_*.txt \
+          "$SNAP_DIR"/new_*.txt "$SNAP_DIR"/new_deps.*
+    rm -rf "$SNAP_DIR"/plan.*
 }
 trap cleanup EXIT INT TERM
 
@@ -80,7 +97,8 @@ ${BOLD}qapt${NC} — Total Package Installer / Uninstaller
 
 ${BOLD}USAGE${NC}
     qapt install PACKAGE|./FILE.deb [PACKAGE|./FILE.deb ...] [--label NAME] [--desc "description"] [--each]
-    qapt remove  LABEL
+    qapt update  PACKAGE|./FILE.deb [--label NAME]
+    qapt remove  LABEL [--dry-run]
     qapt list
     qapt history
     qapt audit   LABEL
@@ -99,8 +117,21 @@ ${BOLD}COMMANDS${NC}
                 Use --each to install each package under its own label
                 (package name used as label for each) without prompting.
 
-    remove      Remove everything installed under LABEL, skipping any
-                package that is also needed by another active label.
+    update      Update a single already-tracked app to a newer version,
+                from a repo package name or a local .deb file. Only works
+                on a label that tracks exactly one top-level package — a
+                multi-package label must be removed and reinstalled
+                instead. If --label is omitted, it defaults to the
+                resolved package name (same rule as install).
+
+    remove      Purge everything installed under LABEL. Keeps any package
+                that another active label tracks, that other installed
+                software still needs, or that you have since installed
+                explicitly yourself. The plan is checked with an apt
+                simulation first and shown before you confirm; nothing
+                outside the label is removed. Also offers to move leftover
+                per-user settings folders to the trash.
+                --dry-run shows the plan without changing anything.
 
     list        Show all active labels and their top-level packages.
 
@@ -113,6 +144,7 @@ ${BOLD}OPTIONS${NC}
 
     --label NAME      Label to group this install under.
     --desc  TEXT      Free-text description stored with the label.
+    --dry-run         (remove) Show what would be removed, change nothing.
 
 ${BOLD}EXAMPLES${NC}
 
@@ -122,6 +154,9 @@ ${BOLD}EXAMPLES${NC}
     qapt install gimp inkscape vlc --each
     qapt install ./google-chrome-stable_current_amd64.deb
     qapt install gimp ./slack-desktop_amd64.deb --label extras
+    qapt update  ./qbible_1.2.0_all.deb
+    qapt update  firefox
+    qapt remove  gimp --dry-run
     qapt remove  gimp
     qapt list
     qapt history
@@ -174,6 +209,74 @@ deb_package_name() {
     printf '%s' "$name"
 }
 
+# Resolve a single install-time argument (repo package name or local .deb
+# file path) into what apt-get should be given and the bare package name
+# to track. Validates as it goes and exits on failure. Sets the globals
+# RESOLVED_ARG (exact string for apt-get) and RESOLVED_NAME (bare name).
+resolve_install_target() {
+    local target="$1"
+
+    if [[ "$target" == *.deb ]]; then
+        local deb_path="$target"
+        # Make sure apt-get treats a bare filename as a local file,
+        # not a repo package name.
+        [[ "$deb_path" != */* ]] && deb_path="./${deb_path}"
+        validate_deb_file "$deb_path"
+
+        local deb_name
+        if ! deb_name=$(deb_package_name "$deb_path"); then
+            log_error "Could not read package info from '$deb_path'. Is it a valid .deb file?"
+            exit 1
+        fi
+
+        RESOLVED_ARG="$deb_path"
+        RESOLVED_NAME="$deb_name"
+    else
+        validate_package_name "$target"
+        RESOLVED_ARG="$target"
+        RESOLVED_NAME="$target"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# apt helpers
+# ---------------------------------------------------------------------------
+
+# Package names an apt-get simulation (-s) would install / remove.
+# Read the simulation output on stdin; any :arch suffix is stripped so the
+# names line up with the dpkg-query snapshots.
+sim_installs() { awk '$1 == "Inst" { sub(/:.*/, "", $2); print $2 }' | sort -u; }
+sim_removals() { awk '$1 == "Remv" || $1 == "Purg" { sub(/:.*/, "", $2); print $2 }' | sort -u; }
+
+# Filter the package names on stdin down to those currently installed.
+installed_only() {
+    local pkgs=()
+    mapfile -t pkgs < <(awk 'NF')
+    (( ${#pkgs[@]} > 0 )) || return 0
+    { dpkg-query -W -f='${Package} ${db:Status-Abbrev}\n' "${pkgs[@]}" 2>/dev/null || true; } \
+        | awk '$2 ~ /^.i/ { print $1 }' | sort -u
+}
+
+# Installed packages that the given packages directly Depend / Pre-Depend on
+# (including the installed providers of virtual dependencies).
+hard_deps_of() {
+    (( $# > 0 )) || return 0
+    { apt-cache depends --installed --important "$@" 2>/dev/null || true; } \
+        | awk '/^ / { sub(/^[ |]*(Pre)?Depends: /, ""); gsub(/[<> ]/, ""); sub(/:.*/, ""); if ($0 != "") print }' \
+        | sort -u
+}
+
+# Number of lines in a file (0 if missing or empty)
+line_count() {
+    if [[ -s "$1" ]]; then wc -l < "$1"; else echo 0; fi
+}
+
+# Join arguments with single spaces, regardless of the global IFS
+join_space() {
+    local IFS=' '
+    echo "$*"
+}
+
 # ---------------------------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------------------------
@@ -204,10 +307,16 @@ snapshot() {
 
 # Diff before/after snapshots → new packages introduced by this install.
 # Writes to $ACTIVE_DIR/<label>.pkgs
+# If the install was previewed (expected_<label>.txt from the apt simulation),
+# only packages this install was expected to bring in are tracked — anything
+# else that appeared meanwhile (e.g. unattended-upgrades installing a new
+# kernel) is reported and left untracked, so 'qapt remove' never purges it.
 compute_new_packages() {
     local label="$1"
     local before="$SNAP_DIR/before_${label}.txt"
     local after="$SNAP_DIR/after_${label}.txt"
+    local expected="$SNAP_DIR/expected_${label}.txt"
+    local new="$SNAP_DIR/new_${label}.txt"
     local pkgs_file="$ACTIVE_DIR/${label}.pkgs"
 
     if [[ ! -f "$before" || ! -f "$after" ]]; then
@@ -215,9 +324,21 @@ compute_new_packages() {
         return 1
     fi
 
-    comm -13 "$before" "$after" > "$pkgs_file"
+    comm -13 "$before" "$after" > "$new"
 
-    rm -f "$before" "$after"
+    if [[ -f "$expected" ]]; then
+        comm -12 "$new" "$expected" > "$pkgs_file"
+        local foreign
+        foreign=$(comm -23 "$new" "$expected")
+        if [[ -n "$foreign" ]]; then
+            log_warning "Also installed during this run, but not by this install (left untracked):"
+            printf '%s\n' "$foreign" | sed 's/^/  /'
+        fi
+    else
+        cp "$new" "$pkgs_file"
+    fi
+
+    rm -f "$before" "$after" "$new"
 }
 
 # ---------------------------------------------------------------------------
@@ -231,18 +352,53 @@ write_meta() {
     shift 3
     local top_level_pkgs=("$@")
 
+    # Force a space-joined list regardless of the script's global IFS
+    # (IFS=$'\n\t' would otherwise join with a newline and split the
+    # "packages=" field across multiple lines for a multi-package label).
+    local joined
+    local IFS=' '
+    joined="${top_level_pkgs[*]}"
+
     {
         echo "label=${label}"
         echo "date=$(date --iso-8601=seconds)"
         echo "description=${description}"
-        printf 'packages=%s\n' "${top_level_pkgs[*]}"
+        printf 'packages=%s\n' "$joined"
     } > "${dir}/${label}.meta"
 }
 
+# Prints the field's value, or nothing if the field is absent
 read_meta_field() {
     local file="$1"
     local field="$2"
-    grep "^${field}=" "$file" | cut -d'=' -f2-
+    { grep "^${field}=" "$file" || true; } | cut -d'=' -f2-
+}
+
+# Append an optional field (skipped when the value is empty)
+append_meta_field() {
+    local file="$1"
+    local field="$2"
+    local value="$3"
+    [[ -n "$value" ]] && echo "${field}=${value}" >> "$file"
+    return 0
+}
+
+# After a failed install, track whatever did get installed so that
+# 'qapt remove' can still clean it up.
+save_partial_label() {
+    local label="$1"
+    local description="$2"
+    shift 2
+
+    snapshot "after" "$label"
+    compute_new_packages "$label"
+    if [[ -s "$ACTIVE_DIR/${label}.pkgs" ]]; then
+        write_meta "$ACTIVE_DIR" "$label" "PARTIAL INSTALL${description:+ — ${description}}" "$@"
+        log_warning "Some packages were installed before the failure; they are tracked under '${label}'."
+        echo "  To remove them: qapt remove ${label}"
+    else
+        rm -f "$ACTIVE_DIR/${label}.pkgs"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -271,26 +427,9 @@ cmd_install() {
             -*)
                 log_error "Unknown option: $1"; exit 1 ;;
             *)
-                if [[ "$1" == *.deb ]]; then
-                    local deb_path="$1"
-                    # Make sure apt-get treats a bare filename as a local file,
-                    # not a repo package name.
-                    [[ "$deb_path" != */* ]] && deb_path="./${deb_path}"
-                    validate_deb_file "$deb_path"
-
-                    local deb_name
-                    if ! deb_name=$(deb_package_name "$deb_path"); then
-                        log_error "Could not read package info from '$deb_path'. Is it a valid .deb file?"
-                        exit 1
-                    fi
-
-                    packages+=("$deb_path")
-                    meta_names+=("$deb_name")
-                else
-                    validate_package_name "$1"
-                    packages+=("$1")
-                    meta_names+=("$1")
-                fi
+                resolve_install_target "$1"
+                packages+=("$RESOLVED_ARG")
+                meta_names+=("$RESOLVED_NAME")
                 shift ;;
         esac
     done
@@ -355,6 +494,33 @@ cmd_install() {
         exit 1
     fi
 
+    # Preview the transaction: what apt will install (so unrelated packages
+    # appearing meanwhile aren't attributed to this label), and anything it
+    # would have to remove to make room (conflicting packages).
+    log_step "Checking what will be installed..."
+    local sim_file="$SNAP_DIR/sim_${label}.txt"
+    if ! apt-get -s install "${packages[@]}" > "$sim_file" 2>&1; then
+        log_error "apt-get cannot install: ${packages[*]}"
+        sed 's/^/  /' "$sim_file" >&2
+        exit 1
+    fi
+    sim_installs < "$sim_file" > "$SNAP_DIR/expected_${label}.txt"
+    local replaced=()
+    mapfile -t replaced < <(sim_removals < "$sim_file")
+    rm -f "$sim_file"
+
+    if (( ${#replaced[@]} > 0 )); then
+        echo ""
+        log_warning "Installing this will REMOVE these packages already on your system:"
+        printf '  %s\n' "${replaced[@]}"
+        echo ""
+        read -r -p "Continue anyway? (y/N) " reply
+        if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+            log_info "Install cancelled."
+            exit 0
+        fi
+    fi
+
     authenticate
 
     log_step "Snapshotting system state (before)..."
@@ -362,9 +528,9 @@ cmd_install() {
 
     log_step "Installing: ${packages[*]}"
     echo ""
-    if ! sudo apt-get -y install "${packages[@]}"; then
+    if ! sudo apt-get -y "${APT_LOCK_WAIT[@]}" install "${packages[@]}"; then
         log_error "apt-get install failed."
-        rm -f "$SNAP_DIR/before_${label}.txt"
+        save_partial_label "$label" "$description" "${meta_names[@]}"
         exit 1
     fi
     echo ""
@@ -380,8 +546,8 @@ cmd_install() {
         fi
     done
     if [[ "$install_ok" == false ]]; then
-        log_error "One or more packages failed to install. Aborting label creation."
-        rm -f "$SNAP_DIR/before_${label}.txt"
+        log_error "One or more packages failed to install."
+        save_partial_label "$label" "$description" "${meta_names[@]}"
         exit 1
     fi
 
@@ -407,6 +573,7 @@ cmd_install() {
     fi
 
     write_meta "$ACTIVE_DIR" "$label" "$description" "${meta_names[@]}"
+    append_meta_field "$ACTIVE_DIR/${label}.meta" "replaced" "$(join_space "${replaced[@]}")"
 
     echo ""
     log_success "Label '${label}' created."
@@ -419,14 +586,346 @@ cmd_install() {
 }
 
 # ---------------------------------------------------------------------------
+# update
+# ---------------------------------------------------------------------------
+
+# Update a single, already-tracked app to a newer version (repo package or
+# local .deb file). Only works for a label that tracks exactly one
+# top-level package — a multi-package label must be removed and
+# reinstalled instead, since "update" has no sensible meaning for a group.
+cmd_update() {
+    local label=""
+    local target=""
+
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            --label)
+                [[ -z "${2:-}" ]] && { log_error "--label requires a value"; exit 1; }
+                label="$2"; shift 2 ;;
+            -*)
+                log_error "Unknown option: $1"; exit 1 ;;
+            *)
+                if [[ -n "$target" ]]; then
+                    log_error "qapt update takes exactly one PACKAGE or .deb file."
+                    exit 1
+                fi
+                target="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$target" ]]; then
+        log_error "No package or .deb file specified. Usage: qapt update PACKAGE|./FILE.deb [--label NAME]"
+        exit 1
+    fi
+
+    resolve_install_target "$target"
+    local new_arg="$RESOLVED_ARG"
+    local new_base="${RESOLVED_NAME%%:*}"
+
+    # Default label to the resolved package name, same rule cmd_install uses.
+    [[ -z "$label" ]] && label="$new_base"
+    validate_label "$label"
+
+    if [[ ! -f "$ACTIVE_DIR/${label}.meta" ]]; then
+        log_error "No active label named '${label}'. Run 'qapt list' to see active labels, or use 'qapt install' for a new package."
+        exit 1
+    fi
+
+    if [[ ! -f "$ACTIVE_DIR/${label}.pkgs" ]]; then
+        log_error "Package list missing for label '${label}'. Cannot safely update."
+        exit 1
+    fi
+
+    local tracked_pkgs
+    tracked_pkgs=$(read_meta_field "$ACTIVE_DIR/${label}.meta" "packages")
+
+    # wc -w splits on its own notion of whitespace, independent of this
+    # script's global IFS=$'\n\t' — safe to use for counting here.
+    local tracked_count
+    tracked_count=$(wc -w <<< "$tracked_pkgs")
+
+    if (( tracked_count != 1 )); then
+        log_error "Label '${label}' tracks ${tracked_count} top-level packages (${tracked_pkgs})."
+        echo "  'qapt update' only works on a label that tracks a single app." >&2
+        echo "  Remove and reinstall the group instead for a multi-package label." >&2
+        exit 1
+    fi
+
+    local tracked_name="${tracked_pkgs%%:*}"
+    if [[ "$tracked_name" != "$new_base" ]]; then
+        log_error "'$target' resolves to package '${new_base}', but label '${label}' tracks '${tracked_name}'."
+        echo "  'qapt update' can only update a label to a newer version of the same package." >&2
+        exit 1
+    fi
+
+    authenticate
+
+    log_step "Snapshotting system state (before)..."
+    snapshot "before" "$label"
+
+    log_step "Updating '${tracked_name}' via: ${new_arg}"
+    echo ""
+    if ! sudo apt-get -y "${APT_LOCK_WAIT[@]}" install "$new_arg"; then
+        log_error "apt-get install failed."
+        rm -f "$SNAP_DIR/before_${label}.txt"
+        exit 1
+    fi
+    echo ""
+
+    if ! dpkg-query -W -f='${Status}' "$tracked_name" 2>/dev/null \
+            | grep -q "install ok installed"; then
+        log_error "Package '${tracked_name}' does not appear to be installed after update."
+        rm -f "$SNAP_DIR/before_${label}.txt"
+        exit 1
+    fi
+
+    log_step "Snapshotting system state (after)..."
+    snapshot "after" "$label"
+
+    # Any packages newly pulled in by the update (e.g. a new dependency the
+    # updated version requires) get folded into the label's tracked set.
+    # Packages the update no longer needs are deliberately left tracked —
+    # same limitation cmd_install already has for the initial install.
+    local new_deps
+    new_deps=$(mktemp "$SNAP_DIR/new_deps.XXXXXX")
+    comm -13 "$SNAP_DIR/before_${label}.txt" "$SNAP_DIR/after_${label}.txt" > "$new_deps"
+    rm -f "$SNAP_DIR/before_${label}.txt" "$SNAP_DIR/after_${label}.txt"
+
+    local new_dep_count=0
+    [[ -s "$new_deps" ]] && new_dep_count=$(wc -l < "$new_deps")
+
+    if (( new_dep_count > 0 )); then
+        sort -u "$ACTIVE_DIR/${label}.pkgs" "$new_deps" -o "$ACTIVE_DIR/${label}.pkgs"
+    fi
+    rm -f "$new_deps"
+
+    local description replaced
+    description=$(read_meta_field "$ACTIVE_DIR/${label}.meta" "description")
+    replaced=$(read_meta_field "$ACTIVE_DIR/${label}.meta" "replaced")
+    write_meta "$ACTIVE_DIR" "$label" "$description" "$tracked_name"
+    append_meta_field "$ACTIVE_DIR/${label}.meta" "replaced" "$replaced"
+
+    local pkg_count
+    pkg_count=$(wc -l < "$ACTIVE_DIR/${label}.pkgs")
+
+    echo ""
+    log_success "Label '${label}' updated."
+    log_info    "Package            : ${tracked_name}"
+    log_info    "New deps picked up : ${new_dep_count}"
+    log_info    "Total pkgs tracked : ${pkg_count} (including dependencies)"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
 # remove
 # ---------------------------------------------------------------------------
 
+# Work out exactly what removing a label would do, without changing
+# anything. Writes these files (one package per line, sorted) to $PLAN_DIR:
+#   remove  — packages that will be purged
+#   needed  — label packages kept because other installed software needs them
+#   manual  — label dependencies you have since installed explicitly yourself
+#   shared  — label packages also tracked by another active label
+#   gone    — label packages that are no longer installed
+# Returns 1 (after printing why) if no safe plan can be produced.
+plan_removal() {
+    local label="$1"
+    local p="$PLAN_DIR"
+
+    sort -u "$ACTIVE_DIR/${label}.pkgs" > "$p/label"
+    installed_only < "$p/label" > "$p/installed"
+    comm -23 "$p/label" "$p/installed" > "$p/gone"
+
+    # Packages tracked by other active labels are protected
+    : > "$p/protected"
+    shopt -s nullglob
+    local f
+    for f in "$ACTIVE_DIR"/*.pkgs; do
+        [[ "$(basename "$f" .pkgs)" != "$label" ]] && cat "$f" >> "$p/protected"
+    done
+    shopt -u nullglob
+    sort -u "$p/protected" -o "$p/protected"
+    comm -12 "$p/installed" "$p/protected" > "$p/shared"
+    comm -23 "$p/installed" "$p/protected" > "$p/work"
+
+    # A dependency that apt now lists as "manually installed" is one you
+    # have since asked for explicitly — keep it. (The label's own top-level
+    # packages are manual by definition, so they don't count.)
+    read_meta_field "$ACTIVE_DIR/${label}.meta" "packages" \
+        | tr ' ' '\n' | sed 's/:.*//' | awk 'NF' | sort -u > "$p/top"
+    apt-mark showmanual | sort -u > "$p/all_manual"
+    comm -12 "$p/work" "$p/all_manual" | comm -23 - "$p/top" > "$p/manual"
+    comm -23 "$p/work" "$p/manual" > "$p/work.new"
+    mv "$p/work.new" "$p/work"
+
+    # Ask apt which of these would become unneeded if none of them were
+    # wanted any more: mark them all "automatically installed" in a scratch
+    # copy of apt's state file and simulate an autoremove. Anything still
+    # required or recommended by other installed software is kept; merely
+    # being "suggested" (an optional extra) is not a reason to keep it.
+    cp /var/lib/apt/extended_states "$p/states" 2>/dev/null || : > "$p/states"
+    local work=()
+    mapfile -t work < "$p/work"
+    if (( ${#work[@]} > 0 )); then
+        apt-mark -o Dir::State::extended_states="$p/states" auto "${work[@]}" > /dev/null
+    fi
+    if ! apt-get -s -o Dir::State::extended_states="$p/states" \
+            -o APT::AutoRemove::SuggestsImportant=false \
+            autoremove --purge > "$p/sim" 2>&1; then
+        log_error "apt cannot work out a removal plan:"
+        sed 's/^/  /' "$p/sim" >&2
+        return 1
+    fi
+    sim_removals < "$p/sim" > "$p/orphans"
+    comm -12 "$p/work" "$p/orphans" > "$p/remove"
+    comm -23 "$p/work" "$p/remove" > "$p/needed"
+
+    # Verify with a purge simulation that nothing outside the plan would go
+    # with it. An outside package can only be caught up if it hard-depends
+    # on something in the plan (e.g. a package that was already orphaned) —
+    # keep whatever it depends on and check again until the plan is clean.
+    local remove=() extra=() rounds=0
+    while [[ -s "$p/remove" ]]; do
+        mapfile -t remove < "$p/remove"
+        if ! apt-get -s purge "${remove[@]}" > "$p/sim" 2>&1; then
+            log_error "apt cannot simulate removing label '${label}':"
+            sed 's/^/  /' "$p/sim" >&2
+            return 1
+        fi
+        if [[ -n "$(sim_installs < "$p/sim")" ]]; then
+            log_error "Removing label '${label}' would make apt install other packages:"
+            sim_installs < "$p/sim" | sed 's/^/  /' >&2
+            return 1
+        fi
+
+        sim_removals < "$p/sim" | comm -23 - "$p/remove" > "$p/extra"
+        [[ -s "$p/extra" ]] || return 0
+
+        mapfile -t extra < "$p/extra"
+        hard_deps_of "${extra[@]}" | comm -12 - "$p/remove" > "$p/keep"
+        if [[ ! -s "$p/keep" ]] || (( ++rounds > 25 )); then
+            log_error "Removing label '${label}' would also remove packages outside it:"
+            sed 's/^/  /' "$p/extra" >&2
+            return 1
+        fi
+        sort -u "$p/needed" "$p/keep" -o "$p/needed"
+        comm -23 "$p/remove" "$p/keep" > "$p/remove.new"
+        mv "$p/remove.new" "$p/remove"
+    done
+}
+
+# Refuse to remove the active login screen (display manager): the system
+# would boot without one. Returns 1 if the plan would remove it.
+check_display_manager() {
+    local dm_file=/etc/X11/default-display-manager
+    [[ -r "$dm_file" ]] || return 0
+
+    local dm_pkg
+    dm_pkg=$(dpkg -S "$(< "$dm_file")" 2>/dev/null | head -n 1 | cut -d: -f1) || true
+    [[ -n "$dm_pkg" ]] || return 0
+
+    if grep -qxF "$dm_pkg" "$PLAN_DIR/remove"; then
+        log_error "This would remove '${dm_pkg}', your current login screen (display manager)."
+        echo "  Switch to another display manager first, e.g.: sudo dpkg-reconfigure gdm3" >&2
+        return 1
+    fi
+}
+
+# Names that per-user settings folders of the given packages are likely to
+# use: the package names, the commands they install, and any name prefix
+# shared by three or more of them (e.g. "xfce4" from xfce4-panel,
+# xfce4-session, ...). Must run while the packages are still installed.
+config_name_hints() {
+    (( $# > 0 )) || return 0
+    {
+        printf '%s\n' "$@"
+        { dpkg -L "$@" 2>/dev/null || true; } \
+            | awk -F/ '$0 ~ "^/usr/(s?bin|games)/[^/]+$" { print $NF }'
+        printf '%s\n' "$@" | awk -F- 'NF > 1 { n[$1]++ } END { for (s in n) if (n[s] >= 3) print s }'
+    } | tr '[:upper:]' '[:lower:]' | sort -u
+}
+
+# Folders in ~/.config, ~/.local/share, ~/.cache and dot-folders in ~ whose
+# name matches one of the hints (case-insensitive). Generic shared folders
+# such as ~/.local/share/fonts are never reported.
+find_user_leftovers() {
+    local hints="$1"
+    local base path name
+    for base in "$HOME/.config" "$HOME/.local/share" "$HOME/.cache" "$HOME"; do
+        [[ -d "$base" ]] || continue
+        while IFS= read -r -d '' path; do
+            name="${path##*/}"
+            if [[ "$base" == "$HOME" ]]; then
+                [[ "$name" == .* ]] || continue
+                name="${name#.}"
+            fi
+            name="${name,,}"
+            [[ " ${SHARED_USER_DIRS} " == *" ${name} "* ]] && continue
+            if grep -qxF "$name" "$hints"; then
+                printf '%s\n' "$path"
+            fi
+        done < <(find "$base" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+    done
+}
+
+# Offer to move each leftover folder to the trash, one at a time
+offer_user_leftovers() {
+    local hints="$1"
+    local leftovers=()
+    mapfile -t leftovers < <(find_user_leftovers "$hints")
+    (( ${#leftovers[@]} > 0 )) || return 0
+
+    echo ""
+    log_info "Possible leftover settings in your home folder (apt never removes these):"
+    printf '  %s\n' "${leftovers[@]}"
+
+    if ! command -v trash-put > /dev/null; then
+        echo "  Review them and delete any you no longer need (install trash-cli to have qapt do it)."
+        return 0
+    fi
+
+    echo ""
+    local path reply
+    for path in "${leftovers[@]}"; do
+        read -r -p "Move ${path} to the trash? (y/N) " reply
+        if [[ "$reply" =~ ^[Yy]$ ]]; then
+            trash-put -- "$path" && log_success "Trashed ${path}"
+        fi
+    done
+    echo "  Anything trashed can be restored with: trash-restore"
+}
+
+# Print a heading and the packages in a plan file (if it has any)
+show_plan_list() {
+    local heading="$1"
+    local file="$2"
+    [[ -s "$file" ]] || return 0
+    echo "${heading}"
+    sed 's/^/  /' "$file"
+    echo ""
+}
+
 cmd_remove() {
-    local label="${1:-}"
+    local label=""
+    local dry_run=false
+
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            --dry-run)
+                dry_run=true; shift ;;
+            -*)
+                log_error "Unknown option: $1"; exit 1 ;;
+            *)
+                if [[ -n "$label" ]]; then
+                    log_error "qapt remove takes exactly one LABEL."
+                    exit 1
+                fi
+                label="$1"; shift ;;
+        esac
+    done
 
     if [[ -z "$label" ]]; then
-        log_error "No label specified. Usage: qapt remove LABEL"
+        log_error "No label specified. Usage: qapt remove LABEL [--dry-run]"
         exit 1
     fi
 
@@ -442,94 +941,91 @@ cmd_remove() {
         exit 1
     fi
 
-    authenticate
+    log_step "Working out what can be removed safely..."
+    PLAN_DIR=$(mktemp -d "$SNAP_DIR/plan.XXXXXX")
+    plan_removal "$label" || exit 1
 
-    # Build the union of packages tracked by OTHER active labels (protected)
-    local protected_pkgs
-    protected_pkgs=$(mktemp "$SNAP_DIR/protected.XXXXXX")
+    local p="$PLAN_DIR"
+    local remove_count
+    remove_count=$(line_count "$p/remove")
 
-    shopt -s nullglob
-    local other_pkg_files=()
-    for f in "$ACTIVE_DIR"/*.pkgs; do
-        local other_label
-        other_label=$(basename "$f" .pkgs)
-        [[ "$other_label" != "$label" ]] && other_pkg_files+=("$f")
-    done
-    shopt -u nullglob
+    echo ""
+    log_info "Label                               : ${label}"
+    log_info "Packages to remove                  : ${remove_count}"
+    log_info "Kept — needed by other software     : $(line_count "$p/needed")"
+    log_info "Kept — since installed by you       : $(line_count "$p/manual")"
+    log_info "Kept — shared with other qapt labels: $(line_count "$p/shared")"
+    log_info "Already uninstalled                 : $(line_count "$p/gone")"
+    echo ""
 
-    if (( ${#other_pkg_files[@]} > 0 )); then
-        sort -u "${other_pkg_files[@]}" > "$protected_pkgs"
-    else
-        : > "$protected_pkgs"
+    show_plan_list "Packages that will be removed (with their system-wide settings):" "$p/remove"
+    show_plan_list "Kept because other installed software needs them:" "$p/needed"
+    show_plan_list "Kept because you have since installed them explicitly:" "$p/manual"
+
+    check_display_manager || exit 1
+
+    local replaced
+    replaced=$(read_meta_field "$ACTIVE_DIR/${label}.meta" "replaced")
+
+    if [[ "$dry_run" == true ]]; then
+        [[ -n "$replaced" ]] && log_info "The original install removed: ${replaced}"
+        log_info "Dry run — nothing was changed."
+        echo ""
+        return 0
     fi
 
-    # Packages to remove = label's pkgs MINUS protected pkgs
-    local to_remove
-    to_remove=$(mktemp "$SNAP_DIR/to_remove.XXXXXX")
-    comm -23 \
-        <(sort -u "$ACTIVE_DIR/${label}.pkgs") \
-        <(sort -u "$protected_pkgs") \
-        > "$to_remove"
-
-    # Count packages being skipped (shared with other labels)
-    local skip_count=0
-    skip_count=$(comm -12 \
-        <(sort -u "$ACTIVE_DIR/${label}.pkgs") \
-        <(sort -u "$protected_pkgs") \
-        | wc -l)
-
-    local remove_count=0
-    [[ -s "$to_remove" ]] && remove_count=$(wc -l < "$to_remove")
-
-    echo ""
-    log_info "Label                          : ${label}"
-    log_info "Packages to remove             : ${remove_count}"
-    log_info "Skipped (shared by other labels): ${skip_count}"
-    echo ""
+    local kept
+    kept=$(sort -u "$p/needed" "$p/manual" "$p/shared" | paste -sd ' ')
 
     if (( remove_count == 0 )); then
-        log_warning "No packages to remove — all are shared with other labels."
-        rm -f "$protected_pkgs" "$to_remove"
+        log_warning "Nothing to remove — everything in this label is still in use or already gone."
         _archive_label "$label"
+        append_meta_field "$HISTORY_DIR/${label}.meta" "kept" "$kept"
         log_success "Label '${label}' archived to history."
         return 0
     fi
 
-    echo "Packages that will be removed:"
-    sed 's/^/  /' "$to_remove"
-    echo ""
-
     read -r -p "Proceed with removal? (y/N) " reply
     if [[ ! "$reply" =~ ^[Yy]$ ]]; then
         log_info "Removal cancelled."
-        rm -f "$protected_pkgs" "$to_remove"
         exit 0
     fi
 
+    local remove=()
+    mapfile -t remove < "$p/remove"
+
+    # Collect folder-name hints while the packages are still installed
+    config_name_hints "${remove[@]}" > "$p/hints"
+
     echo ""
+    authenticate
+
     log_step "Removing packages..."
-
-    # Load into array — safe because IFS is set to newline+tab
-    local pkgs_to_remove=()
-    while IFS= read -r pkg; do
-        [[ -n "$pkg" ]] && pkgs_to_remove+=("$pkg")
-    done < "$to_remove"
-
-    if ! sudo apt-get -y remove --purge "${pkgs_to_remove[@]}"; then
-        log_error "apt-get remove encountered errors."
-        rm -f "$protected_pkgs" "$to_remove"
+    if ! sudo apt-get -y "${APT_LOCK_WAIT[@]}" purge "${remove[@]}"; then
+        log_error "apt-get purge encountered errors. The label has been kept; run 'qapt remove ${label}' again once fixed."
         exit 1
     fi
-
-    # Clean up any orphaned auto-installed packages
-    sudo apt-get -y autoremove --purge || true
-
     echo ""
-    rm -f "$protected_pkgs" "$to_remove"
+
+    local still_installed
+    still_installed=$(installed_only < "$p/remove")
+    if [[ -n "$still_installed" ]]; then
+        log_warning "These packages are unexpectedly still installed:"
+        printf '%s\n' "$still_installed" | sed 's/^/  /'
+    fi
+
+    offer_user_leftovers "$p/hints"
 
     _archive_label "$label"
+    append_meta_field "$HISTORY_DIR/${label}.meta" "kept" "$kept"
 
+    echo ""
     log_success "Label '${label}' removed successfully."
+    if [[ -n "$replaced" ]]; then
+        echo ""
+        log_info "The original install removed: ${replaced}"
+        echo "  To restore them: sudo apt-get install ${replaced}"
+    fi
     echo ""
     echo "  A record of this install has been saved to history."
     echo "  Run 'qapt history' to review it, or 'qapt audit ${label}' for details."
@@ -608,12 +1104,14 @@ cmd_history() {
     fi
 
     for f in "${meta_files[@]}"; do
-        local lbl date removed desc pkgs
+        local lbl date removed desc pkgs kept replaced
         lbl=$(read_meta_field "$f" "label")
         date=$(read_meta_field "$f" "date")
         removed=$(read_meta_field "$f" "removed")
         desc=$(read_meta_field "$f" "description")
         pkgs=$(read_meta_field "$f" "packages")
+        kept=$(read_meta_field "$f" "kept")
+        replaced=$(read_meta_field "$f" "replaced")
 
         echo ""
         echo -e "  ${BOLD}${lbl}${NC}"
@@ -621,6 +1119,8 @@ cmd_history() {
         echo    "    Removed   : ${removed}"
         echo    "    Packages  : ${pkgs}"
         [[ -n "$desc" ]] && echo "    Notes     : ${desc}"
+        [[ -n "$kept" ]] && echo "    Kept      : ${kept}"
+        [[ -n "$replaced" ]] && echo "    Install had removed: ${replaced}"
         echo    "    Reinstall : sudo apt-get install ${pkgs}"
     done
 
@@ -703,6 +1203,7 @@ main() {
 
     case "$cmd" in
         install) cmd_install "$@" ;;
+        update)  cmd_update  "$@" ;;
         remove)  cmd_remove  "$@" ;;
         list)    cmd_list         ;;
         history) cmd_history      ;;
